@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+红树林样本制作脚本（2010 / 2015 / 2020）
+s
+依据：
+- 《红树林样本制作要求_2010_2015_2020.md》
+
+实现规则：
+- 只处理目标格网 FID=48、49
+- 每个格网、每个年份生成 1000 个红树林正样本点
+- 输出字段统一为：grid_id、Year、PXLVAL
+- PXLVAL 固定为 1
+
+说明：
+- 原始 fishnet 中，FID=48/49 对应的原始 grid_id 可能是 36/35
+- 为满足最终样本文件要求，本脚本输出时统一写成：
+  - FID 48 -> grid_id 48
+  - FID 49 -> grid_id 49
+"""
+
+
+
+
+
+
+
+from pathlib import Path
+import random
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+from shapely import make_valid
+from shapely.geometry import Point
+
+
+random.seed(42)
+np.random.seed(42)
+
+# ==================== 配置区 ====================
+BASE_DIR = Path(r"D:\GisHomwork\RawData")
+
+FISHNET_PATH = BASE_DIR / "fishnet_top62" / "fishnet_top62.shp"
+MANGROVE_PATHS = {
+    2010: BASE_DIR / "gmw_v3_2010_vec" / "gmw_v3_2010_vec.shp",
+    2015: BASE_DIR / "gmw_v3_2015_vec" / "gmw_v3_2015_vec.shp",
+    2020: BASE_DIR / "gmw_v3_2020_vec" / "gmw_v3_2020_vec.shp",
+}
+
+INTERMEDIATE_DIR = BASE_DIR / "intermediate"
+OUTPUT_DIR = BASE_DIR / "output_samples"
+
+TARGET_FIDS = [48, 49]
+SAMPLES_PER_GRID = 1000
+TARGET_CRS = "EPSG:4326"
+
+
+def ensure_path_exists(path: Path) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"找不到文件：{path}")
+
+
+def clear_shapefile(path: Path) -> None:
+    for ext in [".shp", ".shx", ".dbf", ".prj", ".cpg", ".qix"]:
+        sidecar = path.with_suffix(ext)
+        if sidecar.exists():
+            sidecar.unlink()
+
+
+def save_gdf(gdf: gpd.GeoDataFrame, path: Path) -> None:
+    clear_shapefile(path)
+    gdf.to_file(path, index=False)
+
+
+
+
+
+
+
+
+
+def clean_polygon_gdf(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    gdf = gdf[gdf.geometry.notna()].copy()
+    gdf = gdf[~gdf.geometry.is_empty].copy()
+
+    if gdf.empty:
+        return gdf
+
+    invalid_mask = ~gdf.geometry.is_valid
+    invalid_count = int(invalid_mask.sum())
+    if invalid_count > 0:
+        print(f"发现无效几何 {invalid_count} 个，尝试修复...")
+
+    try:
+        gdf["geometry"] = gdf.geometry.apply(make_valid)
+    except Exception:
+        gdf["geometry"] = gdf.geometry.buffer(0)
+
+    gdf = gdf[gdf.geometry.notna()].copy()
+    gdf = gdf[~gdf.geometry.is_empty].copy()
+
+    if gdf.empty:
+        return gdf
+
+    still_invalid_mask = ~gdf.geometry.is_valid
+    still_invalid_count = int(still_invalid_mask.sum())
+    if still_invalid_count > 0:
+        print(f"仍有 {still_invalid_count} 个几何无法修复，已剔除。")
+        gdf = gdf[~still_invalid_mask].copy()
+
+    gdf = gdf[gdf.geometry.notna()].copy()
+    gdf = gdf[~gdf.geometry.is_empty].copy()
+    return gdf
+
+
+
+def select_target_grids() -> gpd.GeoDataFrame:
+    print("步骤1：提取目标格网（FID=48,49）")
+    fishnet = gpd.read_file(FISHNET_PATH)
+
+    if fishnet.crs is None:
+        raise ValueError("fishnet_top62.shp 缺少坐标系定义，无法继续处理。")
+
+    print(f"格网总数：{len(fishnet)}")
+    print(f"格网字段：{list(fishnet.columns)}")
+
+    fid_field = None
+    for field in ["FID", "fid", "OBJECTID", "OID", "Id"]:
+        if field in fishnet.columns:
+            fid_field = field
+            break
+
+    if fid_field:
+        print(f"检测到显式 FID 字段：{fid_field}")
+        target_grids = fishnet[fishnet[fid_field].astype(int).isin(TARGET_FIDS)].copy()
+        target_grids["src_fid"] = target_grids[fid_field].astype(int)
+    else:
+        print("未检测到显式 FID 字段，改用 GeoDataFrame 行索引提取 48、49 号要素。")
+        if len(fishnet) <= max(TARGET_FIDS):
+            raise IndexError("fishnet 要素数量不足，无法按行索引提取 48 和 49。")
+        target_grids = fishnet.iloc[TARGET_FIDS].copy()
+        target_grids["src_fid"] = TARGET_FIDS
+
+    target_grids = target_grids.sort_values("src_fid").copy()
+
+    if len(target_grids) != 2 or set(target_grids["src_fid"].tolist()) != set(TARGET_FIDS):
+        raise ValueError("目标格网提取失败，未能准确获取 FID=48 和 FID=49 两个格网。")
+
+    if "grid_id" in target_grids.columns:
+        target_grids["src_gid"] = target_grids["grid_id"]
+    else:
+        target_grids["src_gid"] = None
+
+    # 按最终样本要求，输出 grid_id 统一写成 48 / 49
+    target_grids["grid_id"] = target_grids["src_fid"].astype(int)
+
+    target_grids = clean_polygon_gdf(target_grids)
+    target_grids = target_grids.to_crs(TARGET_CRS)
+
+    print("目标格网映射关系：")
+    for _, row in target_grids.iterrows():
+        print(
+            f"  FID={row['src_fid']}, 原始grid_id={row['src_gid']}, 输出grid_id={row['grid_id']}"
+        )
+
+    target_grids = target_grids[["grid_id", "src_fid", "src_gid", "geometry"]].copy()
+    return target_grids
+
+
+
+
+
+
+
+def load_mangrove(year: int, target_grids: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    print(f"\n读取 {year} 年红树林数据：{MANGROVE_PATHS[year]}")
+
+    mangrove_meta = gpd.read_file(MANGROVE_PATHS[year], rows=1)
+    mangrove_crs = mangrove_meta.crs
+    if mangrove_crs is None:
+        raise ValueError(f"{year} 年红树林数据缺少坐标系定义。")
+
+    grids_for_bbox = target_grids.to_crs(mangrove_crs)
+    bbox = tuple(grids_for_bbox.total_bounds)
+    print(f"按目标格网范围读取 bbox: {bbox}")
+
+    try:
+        gdf = gpd.read_file(
+            MANGROVE_PATHS[year],
+            bbox=bbox,
+            engine="pyogrio",
+            use_arrow=True,
+        )
+    except TypeError:
+        gdf = gpd.read_file(
+            MANGROVE_PATHS[year],
+            bbox=bbox,
+            engine="pyogrio",
+        )
+    except Exception:
+        gdf = gpd.read_file(
+            MANGROVE_PATHS[year],
+            bbox=bbox,
+        )
+
+    if gdf.empty:
+        raise ValueError(f"{year} 年在目标格网范围内未读取到红树林要素。")
+
+    gdf = gdf[gdf.geometry.notna()].copy()
+    gdf = gdf[~gdf.geometry.is_empty].copy()
+    print(f"{year} 年 bbox 子集原始要素数：{len(gdf)}")
+    print(f"{year} 年 bbox 子集无效几何数：{int((~gdf.geometry.is_valid).sum())}")
+
+    gdf = clean_polygon_gdf(gdf)
+    if gdf.empty:
+        raise ValueError(f"{year} 年目标范围内要素在几何清洗后为空。")
+
+    gdf = gdf.to_crs(TARGET_CRS)
+    print(f"{year} 年 bbox 子集清洗后要素数：{len(gdf)}")
+    return gdf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def clip_mangrove_by_grids(
+    mangrove_gdf: gpd.GeoDataFrame,
+    target_grids: gpd.GeoDataFrame,
+    year: int,
+) -> gpd.GeoDataFrame:
+    print(f"步骤3：裁剪 {year} 年红树林到目标格网范围")
+
+    clipped_parts = []
+
+    for _, grid_row in target_grids.iterrows():
+        grid_id = int(grid_row["grid_id"])
+        single_grid = gpd.GeoDataFrame(
+            {"grid_id": [grid_id]},
+            geometry=[grid_row.geometry],
+            crs=target_grids.crs,
+        )
+
+        part = gpd.overlay(mangrove_gdf, single_grid, how="intersection", keep_geom_type=True)
+        part = clean_polygon_gdf(part)
+
+        if part.empty:
+            raise ValueError(f"{year} 年在 grid_id={grid_id} 范围内没有红树林面，无法生成样本。")
+
+        part["Year"] = year
+        part["PXLVAL"] = 1
+        clipped_parts.append(part[["grid_id", "Year", "PXLVAL", "geometry"]].copy())
+
+        print(f"  grid_id={grid_id} 裁剪后面数：{len(part)}")
+
+    clipped = gpd.GeoDataFrame(pd.concat(clipped_parts, ignore_index=True), crs=TARGET_CRS)
+    return clipped
+
+
+
+
+
+def random_points_in_geometry(geometry, n_points: int) -> list:
+    if geometry.is_empty:
+        raise ValueError("输入几何为空，无法生成随机点。")
+
+    if not geometry.is_valid:
+        geometry = make_valid(geometry)
+    if not geometry.is_valid:
+        geometry = geometry.buffer(0)
+
+    if geometry.is_empty:
+        raise ValueError("输入几何在修复后为空，无法生成随机点。")
+
+    minx, miny, maxx, maxy = geometry.bounds
+
+
+
+
+    points = []
+    attempts = 0
+    max_attempts = max(100000, n_points * 2000)
+
+    while len(points) < n_points and attempts < max_attempts:
+        point = Point(
+            random.uniform(minx, maxx),
+            random.uniform(miny, maxy),
+        )
+        if geometry.covers(point):
+            points.append(point)
+        attempts += 1
+
+    if len(points) != n_points:
+        raise RuntimeError(
+            f"随机撒点失败：目标 {n_points} 个，实际仅生成 {len(points)} 个。"
+        )
+
+    return points
+
+
+def generate_samples_for_year(
+    clipped_mangrove: gpd.GeoDataFrame,
+    year: int,
+) -> gpd.GeoDataFrame:
+    print(f"步骤4-6：生成 {year} 年样本点")
+
+    year_samples = []
+
+    for grid_id in TARGET_FIDS:
+        grid_polygons = clipped_mangrove[clipped_mangrove["grid_id"] == grid_id].copy()
+
+        if grid_polygons.empty:
+            raise ValueError(f"{year} 年 grid_id={grid_id} 没有红树林面，无法生成样本。")
+
+        merged_geom = grid_polygons.geometry.unary_union
+        points = random_points_in_geometry(merged_geom, SAMPLES_PER_GRID)
+
+        sample_gdf = gpd.GeoDataFrame(
+            {
+                "grid_id": [grid_id] * SAMPLES_PER_GRID,
+                "Year": [year] * SAMPLES_PER_GRID,
+                "PXLVAL": [1] * SAMPLES_PER_GRID,
+            },
+            geometry=points,
+            crs=TARGET_CRS,
+        )
+        year_samples.append(sample_gdf)
+
+        print(f"  grid_id={grid_id} 已生成 {len(sample_gdf)} 个点")
+
+    samples = gpd.GeoDataFrame(pd.concat(year_samples, ignore_index=True), crs=TARGET_CRS)
+    validate_samples(samples, year)
+    return samples
+
+
+def validate_samples(samples: gpd.GeoDataFrame, year: int) -> None:
+    required_fields = {"grid_id", "Year", "PXLVAL", "geometry"}
+    if not required_fields.issubset(set(samples.columns)):
+        raise ValueError(f"{year} 年样本缺少必要字段：{required_fields - set(samples.columns)}")
+
+    counts = samples["grid_id"].value_counts().to_dict()
+    for grid_id in TARGET_FIDS:
+        if counts.get(grid_id, 0) != SAMPLES_PER_GRID:
+            raise ValueError(
+                f"{year} 年 grid_id={grid_id} 样本数错误：应为 {SAMPLES_PER_GRID}，实际为 {counts.get(grid_id, 0)}"
+            )
+
+    if not (samples["Year"] == year).all():
+        raise ValueError(f"{year} 年样本 Year 字段存在异常值。")
+
+    if not (samples["PXLVAL"] == 1).all():
+        raise ValueError(f"{year} 年样本 PXLVAL 字段存在非 1 的值。")
+
+    if len(samples) != SAMPLES_PER_GRID * len(TARGET_FIDS):
+        raise ValueError(
+            f"{year} 年总样本数错误：应为 {SAMPLES_PER_GRID * len(TARGET_FIDS)}，实际为 {len(samples)}"
+        )
+
+
+def split_samples_2020(samples_2020: gpd.GeoDataFrame) -> None:
+    print("步骤7：拆分 2020 年样本供 GEE 使用")
+
+    for grid_id in TARGET_FIDS:
+        subset = samples_2020[samples_2020["grid_id"] == grid_id].copy()
+
+        if len(subset) != SAMPLES_PER_GRID:
+            raise ValueError(
+                f"samples_2020_grid{grid_id}.shp 样本数错误：应为 {SAMPLES_PER_GRID}，实际为 {len(subset)}"
+            )
+
+        out_path = OUTPUT_DIR / f"samples_2020_grid{grid_id}.shp"
+        save_gdf(subset, out_path)
+        print(f"  已输出：{out_path}")
+
+
+
+
+def main() -> None:
+    print("开始执行红树林样本制作流程\n")
+
+    ensure_path_exists(FISHNET_PATH)
+    for path in MANGROVE_PATHS.values():
+        ensure_path_exists(path)
+
+    INTERMEDIATE_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    target_grids = select_target_grids()
+    save_gdf(target_grids, INTERMEDIATE_DIR / "target_grids.shp")
+    print(f"已输出：{INTERMEDIATE_DIR / 'target_grids.shp'}")
+
+    all_samples = {}
+
+    for year in [2010, 2015, 2020]:
+        mangrove = load_mangrove(year, target_grids)
+        clipped = clip_mangrove_by_grids(mangrove, target_grids, year)
+
+        clipped_path = INTERMEDIATE_DIR / f"mangrove_{year}_in_grids.shp"
+        save_gdf(clipped, clipped_path)
+        print(f"已输出：{clipped_path}")
+
+        samples = generate_samples_for_year(clipped, year)
+        samples_path = OUTPUT_DIR / f"samples_{year}.shp"
+        save_gdf(samples, samples_path)
+        print(f"已输出：{samples_path}")
+
+        all_samples[year] = samples
+        print(f"{year} 年样本统计：")
+        print(samples["grid_id"].value_counts().sort_index())
+        print("")
+
+    split_samples_2020(all_samples[2020])
+
+    print("\n全部完成。")
+    print(f"中间文件目录：{INTERMEDIATE_DIR}")
+    print(f"样本输出目录：{OUTPUT_DIR}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+if __name__ == "__main__":
+    main()

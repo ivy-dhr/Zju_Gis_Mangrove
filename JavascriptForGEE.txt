@@ -1,0 +1,138 @@
+// ==========================================
+// 1. 导入数据并初始化
+// ==========================================
+var roi = table;
+var mangroveSamples = table2;
+// 🔴 核心修改：字段改为 PXLVAL
+var classProperty = 'PXLVAL'; 
+
+print("研究区要素数量：", roi.size());
+print("红树林正样本数量：", mangroveSamples.size());
+
+// 仅保留研究区边界，关闭影像图层，杜绝瓦片报错
+Map.centerObject(roi, 10);
+Map.addLayer(ee.Image().paint(roi, 0, 2), {palette: 'red'}, '研究区边界');
+
+// ==========================================
+// 2. 生成负样本 + 字段统一 + 过滤无效数据
+// ==========================================
+var worldCover = ee.ImageCollection("ESA/WorldCover/v100").first();
+var nonMangroveMask = worldCover.select('Map').neq(95).clip(roi);
+
+var nonMangroveSamples = nonMangroveMask.selfMask().sample({
+  region: roi,
+  scale: 10,
+  numPixels: 1000,
+  geometries: true,
+  seed: 42
+}).map(function(feat) {
+  // 负样本赋值 PXLVAL = 0
+  return ee.Feature(feat.geometry(), {PXLVAL: 0});
+})
+.filter(ee.Filter.notNull(['PXLVAL']));
+
+// 正样本：统一为 PXLVAL=1，过滤空值
+var cleanMangroveSamples = mangroveSamples.map(function(feat) {
+  return ee.Feature(feat.geometry(), {PXLVAL: 1});
+})
+.filter(ee.Filter.notNull(['PXLVAL']));
+
+// 合并正负样本 + 二次过滤
+var allSamples = cleanMangroveSamples.merge(nonMangroveSamples)
+.filter(ee.Filter.notNull(['PXLVAL']));
+
+print('已成功合并正负样本，总点数:', allSamples.size());
+
+// ==========================================
+// 3. S2去云函数 + 年度合成
+// ==========================================
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+    .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000)
+              .copyProperties(image, ["system:time_start"]);
+}
+
+function getYearlyComposite(year, region) {
+  var startDate = year + '-01-01';
+  var endDate = year + '-12-31';
+  var s2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+    .filterBounds(region)
+    .filterDate(startDate, endDate)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 25))
+    .map(maskS2clouds);
+    
+  var median = s2.median().clip(region);
+  var bands = median.select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12']);
+  var ndvi = bands.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  var mndwi = bands.normalizedDifference(['B3', 'B11']).rename('mNDWI');
+  return bands.addBands([ndvi, mndwi]);
+}
+
+var img2020 = getYearlyComposite(2020, roi);
+var img2025 = getYearlyComposite(2025, roi);
+var featureBands = img2020.bandNames();
+print("2020影像波段：", featureBands);
+
+// ==========================================
+// 4. 样本划分 & 特征提取（高tileScale防溢出）
+// ==========================================
+var samplesWithRandom = allSamples.randomColumn('random');
+var trainingSample = samplesWithRandom.filter(ee.Filter.lt('random', 0.7));
+var validationSample = samplesWithRandom.filter(ee.Filter.gte('random', 0.7));
+
+var trainingData = img2020.sampleRegions({
+  collection: trainingSample,
+  properties: [classProperty],
+  scale: 10,
+  tileScale: 10 
+});
+var validationData = img2020.sampleRegions({
+  collection: validationSample,
+  properties: [classProperty],
+  scale: 10,
+  tileScale: 10
+});
+
+// ==========================================
+// 5. 训练模型 + 完整输出三项精度
+// ==========================================
+var classifier = ee.Classifier.smileRandomForest(100).train({
+  features: trainingData,
+  classProperty: classProperty,
+  inputProperties: featureBands
+});
+
+var validated = validationData.classify(classifier);
+var testAccuracy = validated.errorMatrix(classProperty, 'classification');
+
+print('--- 模型验证集精度评估 ---');
+print('混淆矩阵: ', testAccuracy);
+print('总体精度 (OA): ', testAccuracy.accuracy());
+print('Kappa 系数: ', testAccuracy.kappa());
+
+// ==========================================
+// 6. 影像分类（关闭可视化，降低内存）
+// ==========================================
+var classified2025 = img2025.classify(classifier);
+var mangrove2025 = classified2025.updateMask(classified2025.eq(1));
+
+// 注释影像图层，彻底解决瓦片报错
+// Map.addLayer(img2025, {bands: ['B4', 'B3', 'B2'], min: 0, max: 0.15}, '2025 真彩色背景', false);
+// Map.addLayer(mangrove2025, {palette: ['#00FF00']}, '2025 提取的红树林 (绿色)');
+
+// ==========================================
+// 7. 导出栅格至谷歌云盘
+// ==========================================
+Export.image.toDrive({
+  image: classified2025,
+  description: 'Mangrove_Extraction_2025',
+  folder: 'GEE_Exports',
+  scale: 30,
+  region: roi,
+  maxPixels: 1e13,
+  crs: 'EPSG:4326'
+});
